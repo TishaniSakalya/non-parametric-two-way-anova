@@ -1,2 +1,2 @@
 # Permova
-This repository contains a novel approach for performing non-parametric two-way ANOVA using a bootstrap permutation method.
+This repository contains a novel approach for performing non-parametric two-way ANOVA using a bootstrap permutation method. The method allows for testing the effects of two categorical factors and their interaction on a continuous outcome, without relying on parametric assumptions. The implementation includes functions for bootstrapping, permutation testing, effect size calculation, and power analysis. The package is designed for users who need a robust, flexible tool for analyzing data in situations where traditional ANOVA assumptions are violated.
