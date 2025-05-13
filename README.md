@@ -19,8 +19,8 @@ Classical two-way ANOVA relies heavily on assumptions like normality, equal vari
 
 ## 📂 Folder Guide
 
-- `/code/`: All R functions, test scripts, and diagnostics
-- `/data/`: Synthetic and real-world datasets
+- `/codes/`: All R functions, test scripts, and diagnostics
+- `/data/`: Real-world dataset used
 - `/report/`: Final report and presentation slides
 - `/vignette/`: A walk-through of how to use the method on example data
 
