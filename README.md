@@ -26,7 +26,7 @@ Classical two-way ANOVA relies heavily on assumptions like normality, equal vari
 
 ## 🧪 How to Use
 
-1. Download Permova package (.tar.gz folder ) 
+1. Download Permova package (Permova_0.1.0.tar.gz folder ) 
 2. Install 'Permova' library in R
 3. Run the 'stratified_perm_test_sequential' function for your data
 4. Explore the vignette in `/vignette/` for step-by-step instructions
