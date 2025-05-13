@@ -1,0 +1,685 @@
+---
+title: "method_intro"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{method_intro}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Introduction
+
+This vignette demonstrates how to use a new method in the context of non-parametric two-way ANOVA using the `Permova` package.
+
+# Installation and Loading the Package
+
+``` r
+# Install and load the package (if not already installed)
+# devtools::install("Permova")
+library(Permova)
+```
+
+# Implementation
+
+## Generating data
+
+Load your existing data set with response Y and factors A, B or generate synthetic data using the function below.
+
+``` r
+simulate_non_normal_hetero_interaction <- function(n) {
+ 
+  A <- factor(rep(c("A1", "A2"), each = n / 2))
+  B <- factor(rep(c("B1", "B2"), times = n / 2))
+  
+  mean_A <- ifelse(A == "A2", 1, 0)
+  mean_B <- ifelse(B == "B2", 1.5, 0)
+  interaction_effect <- ifelse(A == "A2" & B == "B2", 2, 0)
+  
+  # Generate residuals from an exponential distribution (non-normal)
+  residuals <- rexp(n, rate = 1)  
+
+  # Increase variance for A2 group (heteroscedasticity)
+  residuals <- residuals * (ifelse(A == "A2", 1.5, 1))
+
+  Y <- mean_A + mean_B + interaction_effect + residuals
+  
+  # Return the simulated data
+  data.frame(A, B, Y)
+}
+
+# Generate the simulated data
+set.seed(4423)  
+data <- simulate_non_normal_hetero_interaction(n = 200)
+```
+
+## Choosing a Bootstrap Method
+
+The function `choose_bootstrap_type` automatically selects the best bootstrap method by checking: - **Homoscedasticity tests** (Breusch-Pagan & Levene) - **Normality test** (Shapiro-Wilk for small samples) - **Outlier detection**
+
+If not already installed, install libraries 'lmtest' and 'car' for the diagnostic test.
+
+``` r
+choose_bootstrap_type <- function(data) {
+  fit <- lm(Y ~ A * B, data = data)
+  
+  # Homoscedasticity tests
+  bp_test <- bptest(fit)$p.value
+  levene_test <- leveneTest(Y ~ A * B, data = data)[1, "Pr(>F)"]
+  
+  # Normality check for residuals (Shapiro-Wilk test)
+  shapiro_test <- if (nrow(data) < 5000) shapiro.test(residuals(fit))$p.value else NA
+  
+  # Outlier detection
+  outliers <- sum(abs(scale(residuals(fit))) > 3)
+  
+  if (bp_test < 0.05 || levene_test < 0.05) {  # Heteroscedasticity detected
+    if (outliers > 0) {
+      return("winsorized")  # Robust to outliers
+    } else {
+      return("wild")  # Handles heteroscedasticity
+    }
+  } else {  # Homoscedasticity detected
+    if (!is.na(shapiro_test) && shapiro_test > 0.05) {
+      return("residual")  # Residuals are normally distributed
+    } else {
+      return("pairwise")  # More general case
+    }
+  }
+}
+
+# Run the function on the simulated dataset
+bootstrap_method <- choose_bootstrap_type(data)
+print(bootstrap_method)  # Expected output: "wild", "residual", etc.
+```
+
+For detailed documentation, use:
+
+``` r
+?choose_bootstrap_type
+```
+
+## Bootstrapping Effect Sizes
+
+Bootstrapping is used to estimate the variability of effect sizes. Each bootstrap function generates a distribution of eta squared values by resampling the dataset multiple times. This helps assess the stability and significance of the estimated effect size.
+
+$$
+\eta^2 = \frac{\text{SS}_{\text{effect}}}{\text{SS}_{\text{total}}}
+$$
+
+where SS_effect is the sum of squared differences between fitted values and the overall mean, and SS_total is the sum of squared differences between observed values and the overall mean.
+
+``` r
+
+eta_squared <- function(fit) {
+  # Check if the fit object is a linear model (lm) or a generalized linear model (glm)
+  if (!inherits(fit, c("lm", "glm"))) {
+    stop("Error: The input must be a linear model (lm) or generalized linear model (glm).")
+  }
+
+  # Check if the model has a response variable Y
+  if (is.null(fit$model$Y)) {
+    stop("Error: The model does not contain a response variable 'Y'.")
+  }
+
+  # Calculate the sum of squares for effect (SS_effect)
+  ss_effect <- sum((fitted(fit) - mean(fit$model$Y))^2)
+
+  # Calculate the total sum of squares (SS_total)
+  ss_total <- sum((fit$model$Y - mean(fit$model$Y))^2)
+
+  # Check if the total sum of squares is zero (which would lead to a division by zero)
+  if (ss_total == 0) {
+    stop("Error: The total sum of squares is zero. This might indicate constant values for Y.")
+  }
+
+  # Return eta squared (effect size)
+  return(ss_effect / ss_total)
+}
+
+
+# Fit a linear model
+fit <- lm(Y ~ A * B, data = data)
+
+# Compute eta squared
+effect_size <- eta_squared(fit)
+print(effect_size)  # Expected output: a numeric value between 0 and 1
+```
+
+For detailed documentation, use:
+
+``` r
+?eta_squared
+```
+
+## Estimate test statistic distribution
+
+Four different bootstrap methods are implemented to estimate the distribution of eta squared values:
+
+Residual Bootstrap: Resamples residuals while keeping fitted values fixed. Wild Bootstrap: Uses randomly weighted residuals to preserve heteroskedasticity. Pairwise Bootstrap: Resamples entire rows (cases) from the dataset. Winsorized Bootstrap: Trims extreme residuals before resampling to reduce outlier influence.
+
+``` r
+
+# Function
+
+bootstrap_functions <- list(
+  residual = function(data, num_samples = 1000) {
+    if (!is.numeric(data$Y)) {
+      stop("Error: 'Y' must be numeric for bootstrap resampling.")
+    }
+
+    fit <- lm(Y ~ A * B, data = data)
+    residuals <- residuals(fit)
+    fitted_values <- fitted(fit)
+
+    boot_stats <- replicate(num_samples, {
+      data$Y <- fitted_values + sample(residuals, replace = TRUE)
+      eta_squared(lm(Y ~ A * B, data = data))
+    })
+    return(boot_stats)
+  },
+
+  wild = function(data, num_samples = 1000) {
+    if (!is.numeric(data$Y)) {
+      stop("Error: 'Y' must be numeric for bootstrap resampling.")
+    }
+    fit <- lm(Y ~ A * B, data = data)
+    residuals <- residuals(fit)
+    fitted_values <- fitted(fit)
+
+    boot_stats <- replicate(num_samples, {
+      weights <- sample(c(-1, 1), length(residuals), replace = TRUE)
+      data$Y <- fitted_values + residuals * weights
+      eta_squared(lm(Y ~ A * B, data = data))
+    })
+    return(boot_stats)
+  },
+
+  pairwise = function(data, num_samples = 1000) {
+    if (!is.numeric(data$Y)) {
+      stop("Error: 'Y' must be numeric for bootstrap resampling.")
+    }
+    boot_stats <- replicate(num_samples, {
+      boot_sample <- data[sample(1:nrow(data), replace = TRUE), ]
+      eta_squared(lm(Y ~ A * B, data = boot_sample))
+    })
+    return(boot_stats)
+  },
+
+  winsorized = function(data, num_samples = 1000, trim = 0.05) {
+    if (!is.numeric(data$Y)) {
+      stop("Error: 'Y' must be numeric for bootstrap resampling.")
+    }
+    fit <- lm(Y ~ A * B, data = data)
+    residuals <- residuals(fit)
+    fitted_values <- fitted(fit)
+
+    lower_bound <- quantile(residuals, trim)
+    upper_bound <- quantile(residuals, 1 - trim)
+    winsorized_residuals <- pmax(pmin(residuals, upper_bound), lower_bound)
+
+    boot_stats <- replicate(num_samples, {
+      data$Y <- fitted_values + sample(winsorized_residuals, replace = TRUE)
+      eta_squared(lm(Y ~ A * B, data = data))
+    })
+    return(boot_stats)
+  }
+)
+
+
+# Obtain results
+results <- bootstrap_functions[[bootstrap_type]](data, num_samples = 1000)
+
+boot_ci <- quantile(results, c(0.025, 0.975))  
+boot_se <- sd(results)  
+
+print(paste("Bootstrap 95% CI:", boot_ci[1], "to", boot_ci[2]))
+print(paste("Bootstrap Standard Error:", boot_se))
+
+boot_df <- data.frame(eta = results, type = "Bootstrap")
+
+ggplot(boot_df, aes(x = eta)) +
+  geom_density(fill = "lightblue", color = "blue", alpha = 0.5) +
+  labs(title = "Bootstrap Distribution of Eta Squared",
+       x = "Eta Squared (Effect Size)",
+       y = "Density") +
+  theme_minimal()
+
+results_df <- data.frame(
+  bootstrap_type = bootstrap_type,
+  mean_eta = mean(results),
+  ci_lower = boot_ci[1],
+  ci_upper = boot_ci[2],
+  se_eta = boot_se
+)
+print(results_df)
+```
+
+For detailed documentation, use:
+
+``` r
+?bootstrap_functions
+```
+
+## Coefficient extraction
+
+If not already installed, install libraries 'stats' and 'data.table'.
+
+This function searches for a coefficient name in a linear model (`lm` object) that matches a given term. If multiple matches exist, it returns the first one.
+
+``` r
+get_coef_name <- function(fit, term) {
+  coef_names <- names(coef(fit))
+
+  # Match coefficients that contain the term
+  match <- grep(term, coef_names, value = TRUE)
+
+  if (length(match) > 0) {
+    return(match[1])  # Return the first match
+  } else {
+    stop(paste("Coefficient", term, "not found in model"))
+  }
+}
+
+
+# Example
+
+# Fit a linear model
+fit <- lm(Y ~ A * B, data = data)
+
+# Apply function to obtain coefficient of factor A
+get_coef_name(fit,"A")
+```
+
+For detailed documentation, use:
+
+``` r
+?get_coef_name
+```
+
+## Calculate test statistic
+
+The proportion of variance explained by factors A, B, and interaction A\*B is computed using the ANOVA sum of squares.
+
+``` r
+calculate_eta_squared <- function(fit, data) {
+  # Check if the dataset is empty
+  if (nrow(data) == 0) {
+    stop("Error: The dataset is empty.")
+  }
+
+  # Ensure data has Y and it's numeric
+  if (!"Y" %in% colnames(data) || !is.numeric(data$Y)) {
+    stop("Error: Y must be a numeric column in the dataset.")
+  }
+
+  # Check if model fit is valid
+  if (!inherits(fit, "lm")) {
+    stop("Error: Input model must be a linear model (lm object).")
+  }
+
+  # Try computing ANOVA safely
+  anova_table <- tryCatch(anova(fit), error = function(e) stop("Error in ANOVA computation."))
+
+  # Ensure ANOVA table contains expected terms
+  required_terms <- c("A", "B", "A:B")
+  missing_terms <- setdiff(required_terms, rownames(anova_table))
+  if (length(missing_terms) > 0) {
+    stop(paste("Error: ANOVA table is missing terms:", paste(missing_terms, collapse = ", ")))
+  }
+
+  # Compute sum of squares
+  ss_A <- anova_table["A", "Sum Sq"]
+  ss_B <- anova_table["B", "Sum Sq"]
+  ss_interaction <- anova_table["A:B", "Sum Sq"]
+
+  # Compute total sum of squares
+  total_ss <- sum((data$Y - mean(data$Y))^2)
+  if (total_ss == 0) {
+    stop("Error: Total sum of squares is zero, likely due to constant Y values.")
+  }
+
+  # Compute effect sizes
+  eta_A <- ss_A / total_ss
+  eta_B <- ss_B / total_ss
+  eta_interaction <- ss_interaction / total_ss
+
+  return(list(eta_A = eta_A, eta_B = eta_B, eta_interaction = eta_interaction))
+}
+
+
+# Example
+
+# Fit a linear model
+fit <- lm(Y ~ A * B, data = data)
+
+# Apply function to obtain eta squared
+calculate_eta_squared(fit,data)
+```
+
+For detailed documentation, use:
+
+``` r
+?calculate_eta_squared
+```
+
+## Data permutation
+
+Data is randomly shuffled based on the type of permutation.
+
+"main_A" : Permute factor A while other variables are kept constant.
+
+"main_B" : Permute factor B while other variables are kept constant.
+
+"interaction" : Permute dependent Y to test interaction.
+
+``` r
+permute_data <- function(data, type) {
+  permuted_data <- as.data.table(copy(data))
+
+  if (type == "main_A") {
+    permuted_data[, A := sample(A)]
+  } else if (type == "main_B") {
+    permuted_data[, B := sample(B)]
+  } else if (type == "interaction") {
+    permuted_data[, Y := sample(Y)]
+  }
+
+  # Ensure factor levels are re-applied correctly after permuting
+  permuted_data[, A := factor(A, levels = unique(data$A))]
+  permuted_data[, B := factor(B, levels = unique(data$B))]
+
+  return(permuted_data)
+}
+
+# Example
+
+permute_data(data,"main_A")
+```
+
+For detailed documentation, use:
+
+``` r
+?permute_data
+```
+
+## Permutation Execution
+
+The Permutation process is repeated B times (generally 1000) to generate a null distribution of eta squared values for each effect. This is later compared with the observed distribution of eta squared.
+
+``` r
+permute_and_fit <- function(data, type, B) {
+  results <- replicate(B, {
+    permuted_data <- permute_data(data, type)
+    fit_perm <- lm(Y ~ A * B, data = permuted_data)
+    ss_eta <- calculate_eta_squared(fit_perm, permuted_data)
+    return(list(eta_A = ss_eta$eta_A, eta_B = ss_eta$eta_B, eta_interaction = ss_eta$eta_interaction))
+  }, simplify = FALSE)
+  
+  return(results)
+}
+
+
+# Example
+
+results=permute_and_fit(data,"main_A",1000)
+```
+
+For detailed documentation, use:
+
+``` r
+?permute_and_fit
+```
+
+## Summarization of Results
+
+Mean, standard deviation, and confidence intervals of permuted eta squared values are computed.
+
+``` r
+summarize_permutation_results <- function(results) {
+  eta_A_values <- sapply(results, function(x) x$eta_A)
+  eta_B_values <- sapply(results, function(x) x$eta_B)
+  eta_interaction_values <- sapply(results, function(x) x$eta_interaction)
+
+  # Extract quantile values correctly
+  ci_A <- quantile(eta_A_values, c(0.025, 0.975), names = FALSE)
+  ci_B <- quantile(eta_B_values, c(0.025, 0.975), names = FALSE)
+  ci_interaction <- quantile(eta_interaction_values, c(0.025, 0.975), names = FALSE)
+
+  summary_A <- c(mean = mean(eta_A_values), sd = sd(eta_A_values), ci_lower = ci_A[1], ci_upper = ci_A[2])
+  summary_B <- c(mean = mean(eta_B_values), sd = sd(eta_B_values), ci_lower = ci_B[1], ci_upper = ci_B[2])
+  summary_interaction <- c(mean = mean(eta_interaction_values), sd = sd(eta_interaction_values), ci_lower = ci_interaction[1], ci_upper = ci_interaction[2])
+
+  return(list(summary_A = summary_A, summary_B = summary_B, summary_interaction = summary_interaction))
+}
+
+```
+
+For detailed documentation, use:
+
+``` r
+?summarize_permutation_results
+```
+
+## Sequential Permutation Testing
+
+The permutation test is performed sequentially, shuffling A, B, and interaction terms, fitting the model and calculating eta squared distributions. Density plots are also generated for easier visual understanding of the distribution.
+
+``` r
+stratified_perm_test_sequential <- function(data, B = 1000) {
+
+  B <- as.integer(B[1])  # Ensure B is a single integer
+  if (is.na(B) || B <= 0) stop("B must be a positive integer")
+
+  cat("B inside stratified_perm_test_sequential:", B, "\n")  # Debugging print
+
+  fit <- lm(Y ~ A * B, data = data)
+  eta_squared_obs <- calculate_eta_squared(fit, data)
+
+  # Ensure eta_squared_obs values are numeric
+  eta_squared_obs$eta_A <- as.numeric(eta_squared_obs$eta_A)
+  eta_squared_obs$eta_B <- as.numeric(eta_squared_obs$eta_B)
+  eta_squared_obs$eta_interaction <- as.numeric(eta_squared_obs$eta_interaction)
+
+  # Run permutations sequentially
+  perm_results <- vector("list", B)
+  for (i in 1:B) {
+    perm_data_A <- permute_data(data, "main_A")
+    perm_data_B <- permute_data(data, "main_B")
+    perm_data_AB <- permute_data(data, "interaction")
+
+    fit_A <- lm(Y ~ A * B, data = perm_data_A)
+    fit_B <- lm(Y ~ A * B, data = perm_data_B)
+    fit_AB <- lm(Y ~ A * B, data = perm_data_AB)
+
+    perm_eta_A <- calculate_eta_squared(fit_A, perm_data_A)$eta_A
+    perm_eta_B <- calculate_eta_squared(fit_B, perm_data_B)$eta_B
+    perm_eta_interaction <- calculate_eta_squared(fit_AB, perm_data_AB)$eta_interaction
+
+    # Ensure perm_eta values are numeric
+    perm_eta_A <- as.numeric(perm_eta_A)
+    perm_eta_B <- as.numeric(perm_eta_B)
+    perm_eta_interaction <- as.numeric(perm_eta_interaction)
+
+    perm_results[[i]] <- list(
+      eta_A = perm_eta_A,
+      eta_B = perm_eta_B,
+      eta_interaction = perm_eta_interaction
+    )
+  }
+
+  # Extract permuted values
+  perm_eta_A <- sapply(perm_results, `[[`, "eta_A")
+  perm_eta_B <- sapply(perm_results, `[[`, "eta_B")
+  perm_eta_interaction <- sapply(perm_results, `[[`, "eta_interaction")
+
+  # Compute p-values (checking greater than observed)
+  p_eta_A <- mean(perm_eta_A >= eta_squared_obs$eta_A)
+  p_eta_B <- mean(perm_eta_B >= eta_squared_obs$eta_B)
+  p_eta_interaction <- mean(perm_eta_interaction >= eta_squared_obs$eta_interaction)
+
+  # Create separate data frames for visualization
+  perm_df_A <- data.frame(eta = perm_eta_A, type = "A")
+  perm_df_B <- data.frame(eta = perm_eta_B, type = "B")
+  perm_df_interaction <- data.frame(eta = perm_eta_interaction, type = "Interaction")
+
+  # Main Effect A Plot
+  plot_A <- ggplot(perm_df_A, aes(x = eta)) +
+    geom_density(fill = "blue", alpha = 0.5) +
+    geom_vline(aes(xintercept = eta_squared_obs$eta_A), color = "darkblue", linetype = "dashed", linewidth = 1) +
+    labs(title = "Main Effect A", x = "Eta Squared for Main Effect A", y = "Density") +
+    theme_minimal()
+
+  # Main Effect B Plot
+  plot_B <- ggplot(perm_df_B, aes(x = eta)) +
+    geom_density(fill = "red", alpha = 0.5) +
+    geom_vline(aes(xintercept = eta_squared_obs$eta_B), color = "darkred", linetype = "dashed", linewidth = 1) +
+    labs(title = "Main Effect B", x = "Eta Squared for Main Effect B", y = "Density") +
+    theme_minimal()
+
+  # Interaction Plot
+  plot_interaction <- ggplot(perm_df_interaction, aes(x = eta)) +
+    geom_density(fill = "green", alpha = 0.5) +
+    geom_vline(aes(xintercept = eta_squared_obs$eta_interaction), color = "darkgreen", linetype = "dashed", linewidth = 1) +
+    labs(title = "Interaction (A:B)", x = "Eta Squared for Interaction A:B", y = "Density") +
+    theme_minimal()
+
+  # Show the plots
+  print(plot_A)
+  print(plot_B)
+  print(plot_interaction)
+
+  # Return the results and p-values
+  return(list(
+    eta_A = eta_squared_obs$eta_A,
+    eta_B = eta_squared_obs$eta_B,
+    eta_interaction = eta_squared_obs$eta_interaction,
+    p_eta_A = p_eta_A,
+    p_eta_B = p_eta_B,
+    p_eta_interaction = p_eta_interaction
+  ))
+}
+
+
+# Example 
+
+# Run the sequential permutation test
+results <- stratified_perm_test_sequential(data, B = 1000)
+```
+
+For detailed documentation, use:
+
+``` r
+?stratified_perm_test_sequential
+```
+
+Results can easily be converted into a table similar to ANOVA, making it easier to compare the results of the novel approach with the traditional methods.
+
+``` r
+
+# Create a data frame to mimic an ANOVA table
+anova_table <- data.frame(
+  Term = c("A", "B", "A:B (Interaction)"),
+  Eta_Squared = c(results$eta_A, results$eta_B, results$eta_interaction),
+  P_Value = c(results$p_eta_A, results$p_eta_B, results$p_eta_interaction),
+  Significance = c(
+    ifelse(results$p_eta_A < 0.05, "***", ""),
+    ifelse(results$p_eta_B < 0.05, "***", ""),
+    ifelse(results$p_eta_interaction < 0.05, "**", "")
+  )
+)
+
+# Print the table in a clear format
+print(anova_table)
+```
+
+## Validation
+
+Compare obtained results with traditional ANOVA and ART ANOVA to validate. Install library 'ARTool' to Perform ART ANOVA.
+
+``` r
+
+# Traditional ANOVA
+fit_anova <- aov(Y ~ A * B, data = data)
+anova(fit_anova)
+
+# ART ANOVA
+
+art_model <- art(Y ~ A * B, data = data)
+anova(art_model)
+```
+
+## Power Analysis
+
+Since power analysis requires many simulations, parallel processing is used to speed up computations by running multiple simulations simultaneously. Install library 'future.apply'if not already installed on RStudio.
+
+``` r
+library(future)
+library(future.apply)
+
+power_analysis_permutation_future <- function(n_per_group, effect_size,
+                                              num_simulations, alpha, B) {
+  # Validate B
+  B <- as.integer(B)
+  if (is.na(B) || B <= 0) stop("B must be a positive integer")
+
+  # Run simulations using parallel processing or sequential if parallel fails
+  results <- tryCatch({
+    future_lapply(1:num_simulations, function(i) {
+      A <- rep(c("A1", "A2"), each = n_per_group * 2)
+      B_factor <- rep(c("B1", "B2"), times = n_per_group * 2)
+
+      # Simulate normal data
+      Y <- rnorm(length(A), mean = ifelse(A == "A1" & B_factor == "B1", 0 + effect_size, 0), sd = 1)
+      data <- data.frame(A = factor(A), B = factor(B_factor), Y = Y)
+
+      # Perform stratified permutation test (make sure it's defined)
+      res <- stratified_perm_test_sequential(data, B = B)
+
+      # Return whether the p-values are less than the alpha threshold
+      c(p_A = as.numeric(res$p_eta_A < alpha),
+        p_B = as.numeric(res$p_eta_B < alpha),
+        p_interaction = as.numeric(res$p_eta_interaction < alpha))
+    })
+  }, error = function(e) {
+    message("Parallel execution failed, using sequential fallback.")
+
+    # Fallback to sequential if parallel fails
+    lapply(1:num_simulations, function(i) {
+      A <- rep(c("A1", "A2"), each = n_per_group * 2)
+      B_factor <- rep(c("B1", "B2"), times = n_per_group * 2)
+
+      # Simulate normal data
+      Y <- rnorm(length(A), mean = ifelse(A == "A1" & B_factor == "B1", 0 + effect_size, 0), sd = 1)
+      data <- data.frame(A = factor(A), B = factor(B_factor), Y = Y)
+
+      # Perform stratified permutation test (make sure it's defined)
+      res <- stratified_perm_test_sequential(data, B = B)
+
+      # Return whether the p-values are less than the alpha threshold
+      c(p_A = as.numeric(res$p_eta_A < alpha),
+        p_B = as.numeric(res$p_eta_B < alpha),
+        p_interaction = as.numeric(res$p_eta_interaction < alpha))
+    })
+  })
+
+  # Combine results into a matrix
+  results <- do.call(rbind, results)
+
+  # Calculate the estimated power
+  return(list(
+    estimated_power_A = mean(results[, "p_A"]),
+    estimated_power_B = mean(results[, "p_B"]),
+    estimated_power_interaction = mean(results[, "p_interaction"]),
+    num_simulations = num_simulations,
+    alpha = alpha
+  ))
+}
+
+
+```
+
+For detailed documentation, use:
+
+``` r
+?power_analysis_permutation_future
+```
